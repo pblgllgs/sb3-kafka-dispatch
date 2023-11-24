@@ -28,6 +28,10 @@ public class OrderCreateHandler {
     )
     public void listen(OrderCreated payload) {
         log.info("Received message: "+ payload.toString());
-        dispatchService.process(payload);
+        try {
+            dispatchService.process(payload);
+        } catch (Exception e) {
+            log.info("Process failure", e);
+        }
     }
 }
