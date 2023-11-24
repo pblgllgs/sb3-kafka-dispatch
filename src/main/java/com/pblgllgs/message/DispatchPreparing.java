@@ -17,6 +17,6 @@ import java.util.UUID;
 @AllArgsConstructor
 @NoArgsConstructor
 @Builder
-public class OrderDispatched {
+public class DispatchPreparing {
     private UUID orderId;
 }
