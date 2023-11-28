@@ -11,6 +11,8 @@ import com.pblgllgs.service.DispatchService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.support.KafkaHeaders;
+import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Component;
 
 @Component
@@ -26,10 +28,13 @@ public class OrderCreateHandler {
             groupId = "dispatch.order.created.consumer",
             containerFactory = "kafkaListenerContainerFactory"
     )
-    public void listen(OrderCreated payload) {
-        log.info("Received message: "+ payload.toString());
+    public void listen(
+            @Header(KafkaHeaders.RECEIVED_PARTITION) Integer partition,
+            @Header(KafkaHeaders.RECEIVED_KEY) String key,
+            OrderCreated payload) {
+        log.info("Received message: partition: " + partition + " - key: " + key + " - payload: " + payload.toString());
         try {
-            dispatchService.process(payload);
+            dispatchService.process(key,payload);
         } catch (Exception e) {
             log.info("Process failure", e);
         }
