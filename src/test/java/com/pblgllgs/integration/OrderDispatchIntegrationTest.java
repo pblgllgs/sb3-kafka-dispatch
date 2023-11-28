@@ -7,6 +7,7 @@ package com.pblgllgs.integration;
  */
 
 import com.pblgllgs.DispatchConfiguration;
+import com.pblgllgs.message.DispatchCompleted;
 import com.pblgllgs.message.DispatchPreparing;
 import com.pblgllgs.message.OrderCreated;
 import com.pblgllgs.message.OrderDispatched;
@@ -16,8 +17,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.cloud.contract.wiremock.AutoConfigureWireMock;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.annotation.KafkaHandler;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -31,10 +34,11 @@ import org.springframework.messaging.support.MessageBuilder;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED;
+import static com.pblgllgs.integration.WiremockUtils.stubWiremock;
 import static java.util.UUID.randomUUID;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -46,6 +50,7 @@ import static org.hamcrest.Matchers.notNullValue;
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 @EmbeddedKafka(controlledShutdown = true)
 @Slf4j
+@AutoConfigureWireMock(port = 0)
 public class OrderDispatchIntegrationTest {
 
     private static final String ORDER_CREATED_TOPIC = "order.created";
@@ -72,11 +77,13 @@ public class OrderDispatchIntegrationTest {
         }
     }
 
+    @KafkaListener(groupId = "KafkaIntegrationTest", topics = {DISPATCH_TRACKING_TOPIC, ORDER_DISPATCHED_TOPIC})
     public static class KafkaTestListener {
         AtomicInteger dispatchPreparingCounter = new AtomicInteger(0);
         AtomicInteger orderDispatchCounter = new AtomicInteger(0);
+        AtomicInteger dispatchCompletedCounter = new AtomicInteger(0);
 
-        @KafkaListener(groupId = "KafkaIntegrationTest", topics = DISPATCH_TRACKING_TOPIC)
+        @KafkaHandler
         void receiveDispatchPreparing(
                 @Header(KafkaHeaders.RECEIVED_KEY) String key,
                 @Payload DispatchPreparing payload
@@ -87,7 +94,7 @@ public class OrderDispatchIntegrationTest {
             dispatchPreparingCounter.incrementAndGet();
         }
 
-        @KafkaListener(groupId = "KafkaIntegrationTest", topics = ORDER_DISPATCHED_TOPIC)
+        @KafkaHandler
         void receiveDispatchPreparing(
                 @Header(KafkaHeaders.RECEIVED_KEY) String key,
                 @Payload OrderDispatched payload) {
@@ -96,30 +103,74 @@ public class OrderDispatchIntegrationTest {
             assertThat(payload, notNullValue());
             orderDispatchCounter.incrementAndGet();
         }
+
+        @KafkaHandler
+        void receiveDispatchCompleted(
+                @Header(KafkaHeaders.RECEIVED_KEY) String key,
+                @Payload DispatchCompleted payload) {
+            log.debug("Received OrderDispatched key: " + key + " - payload " + payload);
+            assertThat(key, notNullValue());
+            assertThat(payload, notNullValue());
+            dispatchCompletedCounter.incrementAndGet();
+        }
     }
 
     @BeforeEach
     public void setUp() {
         testListener.dispatchPreparingCounter.set(0);
         testListener.orderDispatchCounter.set(0);
+        testListener.dispatchCompletedCounter.set(0);
 
-        registry.getListenerContainers().forEach(container ->
-                ContainerTestUtils.waitForAssignment(container, embeddedKafkaBroker.getPartitionsPerTopic()));
+        WiremockUtils.reset();
+
+        registry.getListenerContainers().stream()
+                .forEach(container -> ContainerTestUtils.waitForAssignment(container,
+                        container.getContainerProperties().getTopics().length * embeddedKafkaBroker.getPartitionsPerTopic()));
     }
 
     @Test
-    void testOrderDispatchFlow() throws Exception {
+    void testOrderDispatchFlow_Success() throws Exception {
+        stubWiremock("/api/stock?item=my-item", 200, "true");
         OrderCreated orderCreated = TestEventData.builderOrderCreatedEvent(randomUUID(), "my-item");
-        String key = randomUUID().toString();
-        sendMessage(ORDER_CREATED_TOPIC, key,orderCreated);
+        sendMessage(ORDER_CREATED_TOPIC, randomUUID().toString(), orderCreated);
 
         await().atMost(3, TimeUnit.SECONDS).pollDelay(100, TimeUnit.MILLISECONDS)
                 .until(testListener.dispatchPreparingCounter::get, equalTo(1));
         await().atMost(1, TimeUnit.SECONDS).pollDelay(100, TimeUnit.MILLISECONDS)
                 .until(testListener.orderDispatchCounter::get, equalTo(1));
+        await().atMost(1, TimeUnit.SECONDS).pollDelay(100, TimeUnit.MILLISECONDS)
+                .until(testListener.dispatchCompletedCounter::get, equalTo(1));
     }
 
-    private void sendMessage(String topic, String key,Object data) throws Exception {
+    @Test
+    void testOrderDispatchFlow_NotRetryableException() throws Exception {
+        stubWiremock("/api/stock?item=my-item", 400, "Bad Request");
+        OrderCreated orderCreated = TestEventData.builderOrderCreatedEvent(randomUUID(), "my-item");
+        sendMessage(ORDER_CREATED_TOPIC, randomUUID().toString(), orderCreated);
+
+        TimeUnit.SECONDS.sleep(3);
+        assertThat(testListener.dispatchPreparingCounter.get(), equalTo(0));
+        assertThat(testListener.orderDispatchCounter.get(), equalTo(0));
+        assertThat(testListener.dispatchCompletedCounter.get(), equalTo(0));
+    }
+
+    @Test
+    void testOrderDispatchFlow_RetryThenSuccess() throws Exception {
+        stubWiremock("/api/stock?item=my-item", 503, "Service unavailable", "failOnce", STARTED, "succeedNextTime");
+        stubWiremock("/api/stock?item=my-item", 200, "true", "failOnce", "succeedNextTime", "succeedNextTime");
+        OrderCreated orderCreated = TestEventData.builderOrderCreatedEvent(randomUUID(), "my-item");
+
+        sendMessage(ORDER_CREATED_TOPIC, randomUUID().toString(), orderCreated);
+
+        await().atMost(3, TimeUnit.SECONDS).pollDelay(100, TimeUnit.MILLISECONDS)
+                .until(testListener.dispatchPreparingCounter::get, equalTo(1));
+        await().atMost(1, TimeUnit.SECONDS).pollDelay(100, TimeUnit.MILLISECONDS)
+                .until(testListener.orderDispatchCounter::get, equalTo(1));
+        await().atMost(1, TimeUnit.SECONDS).pollDelay(100, TimeUnit.MILLISECONDS)
+                .until(testListener.dispatchCompletedCounter::get, equalTo(1));
+    }
+
+    private void sendMessage(String topic, String key, Object data) throws Exception {
         kafkaTemplate.send(
                 MessageBuilder
                         .withPayload(data)

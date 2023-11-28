@@ -1,5 +1,7 @@
 package com.pblgllgs.service;
 
+import com.pblgllgs.client.StockServiceClient;
+import com.pblgllgs.message.DispatchCompleted;
 import com.pblgllgs.message.DispatchPreparing;
 import com.pblgllgs.message.OrderCreated;
 import com.pblgllgs.message.OrderDispatched;
@@ -20,38 +22,57 @@ import static org.mockito.Mockito.*;
 
 class DispatchServiceTest {
 
-    private DispatchService dispatchService;
     private KafkaTemplate kafkaProducerMock;
+    private StockServiceClient stockServiceClientMock;
+    private DispatchService service;
 
     @BeforeEach
     void setUp() {
         kafkaProducerMock = mock(KafkaTemplate.class);
-        dispatchService = new DispatchService(kafkaProducerMock);
+        stockServiceClientMock = mock(StockServiceClient.class);
+        service = new DispatchService(kafkaProducerMock, stockServiceClientMock);
     }
 
     @Test
     void process_Success() throws Exception {
         when(kafkaProducerMock.send(anyString(), anyString(), any(DispatchPreparing.class))).thenReturn(mock(CompletableFuture.class));
         when(kafkaProducerMock.send(anyString(), anyString(), any(OrderDispatched.class))).thenReturn(mock(CompletableFuture.class));
+        when(kafkaProducerMock.send(anyString(), anyString(), any(DispatchCompleted.class))).thenReturn(mock(CompletableFuture.class));
+        when(stockServiceClientMock.checkAvailability(anyString())).thenReturn("true");
 
         String key = randomUUID().toString();
         OrderCreated testEvent = TestEventData.builderOrderCreatedEvent(randomUUID(), randomUUID().toString());
-        dispatchService.process(key, testEvent);
+        service.process(key, testEvent);
 
         verify(kafkaProducerMock, times(1)).send(eq("dispatch.tracking"), eq(key), any(DispatchPreparing.class));
         verify(kafkaProducerMock, times(1)).send(eq("order.dispatched"), eq(key), any(OrderDispatched.class));
+        verify(kafkaProducerMock, times(1)).send(eq("dispatch.tracking"), eq(key), any(DispatchCompleted.class));
+        verify(stockServiceClientMock, times(1)).checkAvailability(testEvent.getItem());
+    }
+
+    @Test
+    public void testProcess_StockUnavailable() throws Exception {
+        when(stockServiceClientMock.checkAvailability(anyString())).thenReturn("false");
+
+        String key = randomUUID().toString();
+        OrderCreated testEvent = TestEventData.builderOrderCreatedEvent(randomUUID(), randomUUID().toString());
+        service.process(key, testEvent);
+        verifyNoInteractions(kafkaProducerMock);
+        verify(stockServiceClientMock, times(1)).checkAvailability(testEvent.getItem());
     }
 
     @Test
     public void testProcess_DispatchTrackingProducerThrowsException() {
         String key = randomUUID().toString();
         OrderCreated testEvent = TestEventData.builderOrderCreatedEvent(randomUUID(), randomUUID().toString());
+        when(stockServiceClientMock.checkAvailability(anyString())).thenReturn("true");
         doThrow(new RuntimeException("dispatch tracking producer failure")).when(kafkaProducerMock).send(eq("dispatch.tracking"), eq(key), any(DispatchPreparing.class));
 
-        Exception exception = assertThrows(RuntimeException.class, () -> dispatchService.process(key, testEvent));
+        Exception exception = assertThrows(RuntimeException.class, () -> service.process(key, testEvent));
 
         verify(kafkaProducerMock, times(1)).send(eq("dispatch.tracking"), eq(key), any(DispatchPreparing.class));
         verifyNoMoreInteractions(kafkaProducerMock);
+        verify(stockServiceClientMock, times(1)).checkAvailability(testEvent.getItem());
         assertThat(exception.getMessage(), equalTo("dispatch tracking producer failure"));
     }
 
@@ -60,12 +81,48 @@ class DispatchServiceTest {
         String key = randomUUID().toString();
         OrderCreated testEvent = TestEventData.builderOrderCreatedEvent(randomUUID(), randomUUID().toString());
         when(kafkaProducerMock.send(anyString(), anyString(), any(DispatchPreparing.class))).thenReturn(mock(CompletableFuture.class));
+        when(stockServiceClientMock.checkAvailability(anyString())).thenReturn("true");
         doThrow(new RuntimeException("order dispatched producer failure")).when(kafkaProducerMock).send(eq("order.dispatched"), eq(key), any(OrderDispatched.class));
 
-        Exception exception = assertThrows(RuntimeException.class, () -> dispatchService.process(key, testEvent));
+        Exception exception = assertThrows(RuntimeException.class, () -> service.process(key, testEvent));
 
         verify(kafkaProducerMock, times(1)).send(eq("dispatch.tracking"), eq(key), any(DispatchPreparing.class));
         verify(kafkaProducerMock, times(1)).send(eq("order.dispatched"), eq(key), any(OrderDispatched.class));
+        verifyNoMoreInteractions(kafkaProducerMock);
+        verify(stockServiceClientMock, times(1)).checkAvailability(testEvent.getItem());
         assertThat(exception.getMessage(), equalTo("order dispatched producer failure"));
+    }
+
+    @Test
+    public void testProcess_SecondDispatchTrackingProducerThrowsException() {
+        when(kafkaProducerMock.send(anyString(), anyString(), any(DispatchPreparing.class))).thenReturn(mock(CompletableFuture.class));
+        when(kafkaProducerMock.send(anyString(), anyString(), any(OrderDispatched.class))).thenReturn(mock(CompletableFuture.class));
+        when(stockServiceClientMock.checkAvailability(anyString())).thenReturn("true");
+
+        String key = randomUUID().toString();
+        OrderCreated testEvent = TestEventData.builderOrderCreatedEvent(randomUUID(), randomUUID().toString());
+        doThrow(new RuntimeException("dispatch tracking producer failure")).when(kafkaProducerMock).send(eq("dispatch.tracking"), eq(key), any(DispatchCompleted.class));
+
+        Exception exception = assertThrows(RuntimeException.class, () -> service.process(key, testEvent));
+
+        verify(kafkaProducerMock, times(1)).send(eq("dispatch.tracking"), eq(key), any(DispatchPreparing.class));
+        verify(kafkaProducerMock, times(1)).send(eq("order.dispatched"), eq(key), any(OrderDispatched.class));
+        verify(kafkaProducerMock, times(1)).send(eq("dispatch.tracking"), eq(key), any(DispatchCompleted.class));
+        verify(stockServiceClientMock, times(1)).checkAvailability(testEvent.getItem());
+        assertThat(exception.getMessage(), equalTo("dispatch tracking producer failure"));
+    }
+
+    @Test
+    public void testProcess_StockServiceClient_ThrowsException() {
+        String key = randomUUID().toString();
+        OrderCreated testEvent = TestEventData.builderOrderCreatedEvent(randomUUID(), randomUUID().toString());
+
+        doThrow(new RuntimeException("stock service client failure")).when(stockServiceClientMock).checkAvailability(testEvent.getItem());
+
+        Exception exception = assertThrows(RuntimeException.class, () -> service.process(key, testEvent));
+        assertThat(exception.getMessage(), equalTo("stock service client failure"));
+
+        verifyNoInteractions(kafkaProducerMock);
+        verify(stockServiceClientMock, times(1)).checkAvailability(testEvent.getItem());
     }
 }
