@@ -56,6 +56,7 @@ public class OrderDispatchIntegrationTest {
     private static final String ORDER_CREATED_TOPIC = "order.created";
     private static final String ORDER_DISPATCHED_TOPIC = "order.dispatched";
     private static final String DISPATCH_TRACKING_TOPIC = "dispatch.tracking";
+    private static final String ORDER_CREATED_DLT_TOPIC = "order.created.DLT";
 
     @Autowired
     private KafkaTestListener testListener;
@@ -77,11 +78,12 @@ public class OrderDispatchIntegrationTest {
         }
     }
 
-    @KafkaListener(groupId = "KafkaIntegrationTest", topics = {DISPATCH_TRACKING_TOPIC, ORDER_DISPATCHED_TOPIC})
+    @KafkaListener(groupId = "KafkaIntegrationTest", topics = {DISPATCH_TRACKING_TOPIC, ORDER_DISPATCHED_TOPIC,ORDER_CREATED_DLT_TOPIC})
     public static class KafkaTestListener {
         AtomicInteger dispatchPreparingCounter = new AtomicInteger(0);
         AtomicInteger orderDispatchCounter = new AtomicInteger(0);
         AtomicInteger dispatchCompletedCounter = new AtomicInteger(0);
+        AtomicInteger orderCreatedDLTCounter = new AtomicInteger(0);
 
         @KafkaHandler
         void receiveDispatchPreparing(
@@ -113,6 +115,16 @@ public class OrderDispatchIntegrationTest {
             assertThat(payload, notNullValue());
             dispatchCompletedCounter.incrementAndGet();
         }
+
+        @KafkaHandler
+        void orderCreatedDLT(
+                @Header(KafkaHeaders.RECEIVED_KEY) String key,
+                @Payload OrderCreated payload) {
+            log.debug("Received OrderCreated DLT key: " + key + " - payload " + payload);
+            assertThat(key, notNullValue());
+            assertThat(payload, notNullValue());
+            orderCreatedDLTCounter.incrementAndGet();
+        }
     }
 
     @BeforeEach
@@ -120,6 +132,7 @@ public class OrderDispatchIntegrationTest {
         testListener.dispatchPreparingCounter.set(0);
         testListener.orderDispatchCounter.set(0);
         testListener.dispatchCompletedCounter.set(0);
+        testListener.orderCreatedDLTCounter.set(0);
 
         WiremockUtils.reset();
 
@@ -140,6 +153,7 @@ public class OrderDispatchIntegrationTest {
                 .until(testListener.orderDispatchCounter::get, equalTo(1));
         await().atMost(1, TimeUnit.SECONDS).pollDelay(100, TimeUnit.MILLISECONDS)
                 .until(testListener.dispatchCompletedCounter::get, equalTo(1));
+        assertThat(testListener.orderCreatedDLTCounter.get(), equalTo(0));
     }
 
     @Test
@@ -148,7 +162,8 @@ public class OrderDispatchIntegrationTest {
         OrderCreated orderCreated = TestEventData.builderOrderCreatedEvent(randomUUID(), "my-item");
         sendMessage(ORDER_CREATED_TOPIC, randomUUID().toString(), orderCreated);
 
-        TimeUnit.SECONDS.sleep(3);
+        await().atMost(3, TimeUnit.SECONDS).pollDelay(100, TimeUnit.MILLISECONDS)
+                .until(testListener.orderCreatedDLTCounter::get, equalTo(1));
         assertThat(testListener.dispatchPreparingCounter.get(), equalTo(0));
         assertThat(testListener.orderDispatchCounter.get(), equalTo(0));
         assertThat(testListener.dispatchCompletedCounter.get(), equalTo(0));
@@ -168,6 +183,20 @@ public class OrderDispatchIntegrationTest {
                 .until(testListener.orderDispatchCounter::get, equalTo(1));
         await().atMost(1, TimeUnit.SECONDS).pollDelay(100, TimeUnit.MILLISECONDS)
                 .until(testListener.dispatchCompletedCounter::get, equalTo(1));
+        assertThat(testListener.orderCreatedDLTCounter.get(), equalTo(0));
+    }
+
+    @Test
+    void testOrderDispatchFlow_RetryUntilFailure() throws Exception {
+        stubWiremock("/api/stock?item=my-item", 503, "Service unavailable");
+        OrderCreated orderCreated = TestEventData.builderOrderCreatedEvent(randomUUID(), "my-item");
+        sendMessage(ORDER_CREATED_TOPIC, randomUUID().toString(), orderCreated);
+
+        await().atMost(5, TimeUnit.SECONDS).pollDelay(100, TimeUnit.MILLISECONDS)
+                .until(testListener.orderCreatedDLTCounter::get, equalTo(1));
+        assertThat(testListener.dispatchPreparingCounter.get(), equalTo(0));
+        assertThat(testListener.orderDispatchCounter.get(), equalTo(0));
+        assertThat(testListener.dispatchCompletedCounter.get(), equalTo(0));
     }
 
     private void sendMessage(String topic, String key, Object data) throws Exception {
